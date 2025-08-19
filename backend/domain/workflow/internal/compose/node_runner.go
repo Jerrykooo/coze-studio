@@ -614,37 +614,57 @@ func (r *nodeRunner[O]) postProcess(ctx context.Context, output map[string]any) 
 
 func (r *nodeRunner[O]) invoke(ctx context.Context, input map[string]any, opts ...O) (output map[string]any, err error) {
 	var n int64
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
+		resultCh := make(chan struct {
+			output map[string]any
+			err    error
+		}, 1)
 
-		output, err = r.i(ctx, input, opts...)
-		if err != nil {
-			if _, ok := compose.IsInterruptRerunError(err); ok { // interrupt, won't retry
-				r.interrupted = true
+		safego.Go(ctx, func() {
+			o, err := r.i(ctx, input, opts...)
+			resultCh <- struct {
+				output map[string]any
+				err    error
+			}{o, err}
+		})
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case res := <-resultCh:
+			output, err = res.output, res.err
+			if err != nil {
+				if _, ok := compose.IsInterruptRerunError(err); ok {
+					r.interrupted = true
+					return nil, err
+				}
+
+				logs.CtxErrorf(ctx, "[invoke] node %s ID %s failed on %d attempt, err: %v", r.nodeName, r.nodeKey, n, err)
+
+				if r.maxRetry > n {
+					n++
+					if exeCtx := execute.GetExeCtx(ctx); exeCtx != nil && exeCtx.NodeCtx != nil {
+						exeCtx.CurrentRetryCount++
+					}
+					continue
+				}
+
 				return nil, err
 			}
-
-			logs.CtxErrorf(ctx, "[invoke] node %s ID %s failed on %d attempt, err: %v", r.nodeName, r.nodeKey, n, err)
-			if r.maxRetry > n {
-				n++
-				if exeCtx := execute.GetExeCtx(ctx); exeCtx != nil && exeCtx.NodeCtx != nil {
-					exeCtx.CurrentRetryCount++
-				}
-				continue
-			}
-			return nil, err
+			return output, nil
 		}
-
-		return output, nil
 	}
 }
 
 func (r *nodeRunner[O]) stream(ctx context.Context, input map[string]any, opts ...O) (output *schema.StreamReader[map[string]any], err error) {
 	var n int64
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -652,25 +672,42 @@ func (r *nodeRunner[O]) stream(ctx context.Context, input map[string]any, opts .
 		default:
 		}
 
-		output, err = r.s(ctx, input, opts...)
-		if err != nil {
-			if _, ok := compose.IsInterruptRerunError(err); ok { // interrupt, won't retry
-				r.interrupted = true
+		resultCh := make(chan struct {
+			output *schema.StreamReader[map[string]any]
+			err    error
+		}, 1)
+
+		safego.Go(ctx, func() {
+			o, err := r.s(ctx, input, opts...)
+			resultCh <- struct {
+				output *schema.StreamReader[map[string]any]
+				err    error
+			}{o, err}
+		})
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case res := <-resultCh:
+			output, err = res.output, res.err
+			if err != nil {
+				if _, ok := compose.IsInterruptRerunError(err); ok {
+					r.interrupted = true
+					return nil, err
+				}
+
+				logs.CtxErrorf(ctx, "[stream] node %s ID %s failed on %d attempt, err: %v", r.nodeName, r.nodeKey, n, err)
+				if r.maxRetry > n {
+					n++
+					if exeCtx := execute.GetExeCtx(ctx); exeCtx != nil && exeCtx.NodeCtx != nil {
+						exeCtx.CurrentRetryCount++
+					}
+					continue
+				}
 				return nil, err
 			}
-
-			logs.CtxErrorf(ctx, "[invoke] node %s ID %s failed on %d attempt, err: %v", r.nodeName, r.nodeKey, n, err)
-			if r.maxRetry > n {
-				n++
-				if exeCtx := execute.GetExeCtx(ctx); exeCtx != nil && exeCtx.NodeCtx != nil {
-					exeCtx.CurrentRetryCount++
-				}
-				continue
-			}
-			return nil, err
+			return output, nil
 		}
-
-		return output, nil
 	}
 }
 
@@ -680,8 +717,8 @@ func (r *nodeRunner[O]) collect(ctx context.Context, input *schema.StreamReader[
 	}
 
 	copied := input.Copy(int(r.maxRetry))
-
 	var n int64
+
 	defer func() {
 		for i := n + 1; i < r.maxRetry; i++ {
 			copied[i].Close()
@@ -691,29 +728,54 @@ func (r *nodeRunner[O]) collect(ctx context.Context, input *schema.StreamReader[
 	for {
 		select {
 		case <-ctx.Done():
+			copied[n].Close()
 			return nil, ctx.Err()
 		default:
 		}
 
-		output, err = r.c(ctx, copied[n], opts...)
-		if err != nil {
-			if _, ok := compose.IsInterruptRerunError(err); ok { // interrupt, won't retry
-				r.interrupted = true
+		resultCh := make(chan struct {
+			output map[string]any
+			err    error
+		}, 1)
+
+		safego.Go(ctx, func() {
+			o, err := r.c(ctx, copied[n], opts...)
+			resultCh <- struct {
+				output map[string]any
+				err    error
+			}{o, err}
+		})
+
+		select {
+		case <-ctx.Done():
+			copied[n].Close()
+			return nil, ctx.Err()
+		case res := <-resultCh:
+			output, err = res.output, res.err
+			if err != nil {
+				if _, ok := compose.IsInterruptRerunError(err); ok {
+					r.interrupted = true
+					copied[n].Close()
+					return nil, err
+				}
+
+				logs.CtxErrorf(ctx, "[collect] node %s ID %s failed on %d attempt, err: %v", r.nodeName, r.nodeKey, n, err)
+
+				if r.maxRetry > n {
+					copied[n].Close()
+					n++
+					if exeCtx := execute.GetExeCtx(ctx); exeCtx != nil && exeCtx.NodeCtx != nil {
+						exeCtx.CurrentRetryCount++
+					}
+					continue
+				}
+
+				copied[n].Close()
 				return nil, err
 			}
 
-			logs.CtxErrorf(ctx, "[invoke] node %s ID %s failed on %d attempt, err: %v", r.nodeName, r.nodeKey, n, err)
-			if r.maxRetry > n {
-				n++
-				if exeCtx := execute.GetExeCtx(ctx); exeCtx != nil && exeCtx.NodeCtx != nil {
-					exeCtx.CurrentRetryCount++
-				}
-				continue
-			}
-			return nil, err
+			return output, nil
 		}
-
-		return output, nil
 	}
 }
 
@@ -734,32 +796,55 @@ func (r *nodeRunner[O]) transform(ctx context.Context, input *schema.StreamReade
 	for {
 		select {
 		case <-ctx.Done():
+			copied[n].Close()
 			return nil, ctx.Err()
 		default:
 		}
 
-		output, err = r.t(ctx, copied[n], opts...)
-		if err != nil {
-			if _, ok := compose.IsInterruptRerunError(err); ok { // interrupt, won't retry
-				r.interrupted = true
+		resultCh := make(chan struct {
+			output *schema.StreamReader[map[string]any]
+			err    error
+		}, 1)
+
+		safego.Go(ctx, func() {
+			out, err := r.t(ctx, copied[n], opts...)
+			resultCh <- struct {
+				output *schema.StreamReader[map[string]any]
+				err    error
+			}{out, err}
+		})
+		select {
+		case <-ctx.Done():
+			copied[n].Close()
+			return nil, ctx.Err()
+		case res := <-resultCh:
+			output, err = res.output, res.err
+			if err != nil {
+				if _, ok := compose.IsInterruptRerunError(err); ok {
+					r.interrupted = true
+					copied[n].Close()
+					return nil, err
+				}
+
+				logs.CtxErrorf(ctx, "[transform] node %s ID %s failed on %d attempt, err: %v", r.nodeName, r.nodeKey, n, err)
+
+				if r.maxRetry > n {
+					copied[n].Close()
+					n++
+					if exeCtx := execute.GetExeCtx(ctx); exeCtx != nil && exeCtx.NodeCtx != nil {
+						exeCtx.CurrentRetryCount++
+					}
+					continue
+				}
+
+				copied[n].Close()
 				return nil, err
 			}
 
-			logs.CtxErrorf(ctx, "[invoke] node %s ID %s failed on %d attempt, err: %v", r.nodeName, r.nodeKey, n, err)
-			if r.maxRetry > n {
-				n++
-				if exeCtx := execute.GetExeCtx(ctx); exeCtx != nil && exeCtx.NodeCtx != nil {
-					exeCtx.CurrentRetryCount++
-				}
-				continue
-			}
-			return nil, err
+			return output, nil
 		}
-
-		return output, nil
 	}
 }
-
 func (r *nodeRunner[O]) onEnd(ctx context.Context, output map[string]any) error {
 	if r.errProcessType == vo.ErrorProcessTypeExceptionBranch || r.errProcessType == vo.ErrorProcessTypeReturnDefaultData {
 		output["isSuccess"] = true
